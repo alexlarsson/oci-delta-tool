@@ -8,16 +8,18 @@ import sys
 from pathlib import Path
 from typing import Dict, Set, List, Tuple
 
-def parse_oci_image(image_path: str) -> Tuple[Dict, Set[str], Dict[str, tarfile.TarInfo]]:
+def parse_oci_image(image_path: str) -> Tuple[Dict, Set[str], Dict[str, tarfile.TarInfo], Dict[str, str]]:
     """
     Parse an OCI image tar file and extract:
     - index.json content
     - set of blob digests (layer blobs)
     - mapping of blob digest to TarInfo for accessing blob data
+    - mapping of diff_id (uncompressed digest) to compressed layer digest
     """
     index_data = None
     layer_blobs = set()
     blob_members = {}
+    diff_id_to_digest = {}
 
     with tarfile.open(image_path, 'r') as tar:
         # Read index.json
@@ -43,12 +45,32 @@ def parse_oci_image(image_path: str) -> Tuple[Dict, Set[str], Dict[str, tarfile.
                 f = tar.extractfile(manifest_member)
                 manifest = json.load(f)
 
-                # Add layer blobs
-                for layer in manifest.get('layers', []):
-                    layer_digest = layer['digest'].split(':')[-1]
-                    layer_blobs.add(layer_digest)
+                # Get config to access diff_ids
+                config_digest = manifest.get('config', {}).get('digest', '').split(':')[-1]
+                if config_digest and config_digest in blob_members:
+                    config_member = blob_members[config_digest]
+                    config_f = tar.extractfile(config_member)
+                    config_data = json.load(config_f)
 
-    return index_data, layer_blobs, blob_members
+                    # Get diff_ids (uncompressed layer digests)
+                    diff_ids = config_data.get('rootfs', {}).get('diff_ids', [])
+                    layers = manifest.get('layers', [])
+
+                    # Map diff_id to compressed layer digest
+                    for i, layer in enumerate(layers):
+                        layer_digest = layer['digest'].split(':')[-1]
+                        layer_blobs.add(layer_digest)
+
+                        if i < len(diff_ids):
+                            diff_id = diff_ids[i].split(':')[-1]
+                            diff_id_to_digest[diff_id] = layer_digest
+                else:
+                    # Fallback if no config available
+                    for layer in manifest.get('layers', []):
+                        layer_digest = layer['digest'].split(':')[-1]
+                        layer_blobs.add(layer_digest)
+
+    return index_data, layer_blobs, blob_members, diff_id_to_digest
 
 def list_layer_contents(tar: tarfile.TarFile, blob_digest: str, blob_members: Dict[str, tarfile.TarInfo]) -> List[str]:
     """
@@ -94,31 +116,57 @@ def analyze_delta(old_image: str, new_image: str):
 
     # Parse both images
     print("Parsing old image...")
-    old_index, old_layers, old_blobs = parse_oci_image(old_image)
+    old_index, old_layers, old_blobs, old_diff_ids = parse_oci_image(old_image)
 
     print("Parsing new image...")
-    new_index, new_layers, new_blobs = parse_oci_image(new_image)
+    new_index, new_layers, new_blobs, new_diff_ids = parse_oci_image(new_image)
 
     print()
     print("=" * 80)
     print("LAYER ANALYSIS")
     print("=" * 80)
 
-    # Find layers that are the same
+    # Build reverse mapping for old image: diff_id -> layer_digest
+    old_diff_id_set = set(old_diff_ids.keys())
+
+    # Find layers that match by compressed digest
     common_layers = old_layers & new_layers
-    new_only_layers = new_layers - old_layers
+
+    # Find layers that match by diff_id but not by compressed digest (recompressed)
+    recompressed_layers = set()
+    for diff_id, new_layer_digest in new_diff_ids.items():
+        if diff_id in old_diff_id_set and new_layer_digest not in common_layers:
+            recompressed_layers.add(new_layer_digest)
+
+    # Layers that are truly new (neither digest nor diff_id matches)
+    new_only_layers = new_layers - common_layers - recompressed_layers
     old_only_layers = old_layers - new_layers
 
     print(f"\nLayers in old image: {len(old_layers)}")
     print(f"Layers in new image: {len(new_layers)}")
-    print(f"Common layers (can skip): {len(common_layers)}")
-    print(f"New-only layers (need to include): {len(new_only_layers)}")
+    print(f"Common layers (same digest, can skip): {len(common_layers)}")
+    print(f"Recompressed layers (same content, different compression, can skip): {len(recompressed_layers)}")
+    print(f"New layers (need to process): {len(new_only_layers)}")
     print(f"Old-only layers (removed): {len(old_only_layers)}")
 
     if common_layers:
         print("\nCommon layer digests (these can be completely skipped):")
         for digest in sorted(common_layers):
             print(f"  - {digest[:16]}...")
+
+    if recompressed_layers:
+        print("\nRecompressed layer digests (same content, different compression):")
+        for digest in sorted(recompressed_layers):
+            # Find the matching diff_id
+            diff_id = None
+            for did, dg in new_diff_ids.items():
+                if dg == digest:
+                    diff_id = did
+                    break
+            if diff_id:
+                print(f"  - {digest[:16]}... (diff_id: {diff_id[:16]}...)")
+            else:
+                print(f"  - {digest[:16]}...")
 
     # Collect all ostree objects from old image
     print()
@@ -171,7 +219,8 @@ def analyze_delta(old_image: str, new_image: str):
     print("SUMMARY")
     print("=" * 80)
     print(f"\nLayer optimization:")
-    print(f"  - {len(common_layers)} complete layers can be skipped")
+    print(f"  - {len(common_layers)} identical layers can be skipped")
+    print(f"  - {len(recompressed_layers)} recompressed layers can be skipped (same content)")
     print(f"  - {len(new_only_layers)} layers need to be processed")
 
     print(f"\nOstree object optimization:")

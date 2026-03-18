@@ -191,9 +191,11 @@ def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
                                 if not ostree_root:
                                     print(f"    Provide --ostree-repo to resolve OSTREE chunks", file=sys.stderr)
 
-                            # Compress the reconstructed tar data
+                            # Compress the reconstructed tar data with reproducible settings
+                            # Match podman/buildah compression: level 9, no filename, mtime=0
                             compressed = io.BytesIO()
-                            with gzip.GzipFile(fileobj=compressed, mode='wb', mtime=0) as gz:
+                            with gzip.GzipFile(fileobj=compressed, mode='wb',
+                                             compresslevel=9, mtime=0, filename='') as gz:
                                 gz.write(tar_data)
 
                             compressed_data = compressed.getvalue()

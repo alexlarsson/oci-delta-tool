@@ -14,10 +14,11 @@ CHUNK_TYPE_DATA = 0x00
 CHUNK_TYPE_OSTREE = 0x01
 
 def parse_oci_image(image_path: str):
-    """Parse OCI image and return index, layers, and blob members."""
+    """Parse OCI image and return index, layers, blob members, and diff_id mapping."""
     index_data = None
     layer_blobs = set()
     blob_members = {}
+    diff_id_to_digest = {}  # Map uncompressed digest to compressed digest
 
     with tarfile.open(image_path, 'r') as tar:
         try:
@@ -40,11 +41,32 @@ def parse_oci_image(image_path: str):
                 f = tar.extractfile(manifest_member)
                 manifest = json.load(f)
 
-                for layer in manifest.get('layers', []):
-                    layer_digest = layer['digest'].split(':')[-1]
-                    layer_blobs.add(layer_digest)
+                # Get config to access diff_ids
+                config_digest = manifest.get('config', {}).get('digest', '').split(':')[-1]
+                if config_digest and config_digest in blob_members:
+                    config_member = blob_members[config_digest]
+                    config_f = tar.extractfile(config_member)
+                    config_data = json.load(config_f)
 
-    return index_data, layer_blobs, blob_members
+                    # Get diff_ids (uncompressed layer digests)
+                    diff_ids = config_data.get('rootfs', {}).get('diff_ids', [])
+                    layers = manifest.get('layers', [])
+
+                    # Map diff_id to compressed layer digest
+                    for i, layer in enumerate(layers):
+                        layer_digest = layer['digest'].split(':')[-1]
+                        layer_blobs.add(layer_digest)
+
+                        if i < len(diff_ids):
+                            diff_id = diff_ids[i].split(':')[-1]
+                            diff_id_to_digest[diff_id] = layer_digest
+                else:
+                    # Fallback if no config available
+                    for layer in manifest.get('layers', []):
+                        layer_digest = layer['digest'].split(':')[-1]
+                        layer_blobs.add(layer_digest)
+
+    return index_data, layer_blobs, blob_members, diff_id_to_digest
 
 def find_ostree_objects_in_layer(tar: tarfile.TarFile, blob_digest: str, blob_members: Dict) -> Set[str]:
     """Find all ostree object files in a layer."""
@@ -173,13 +195,26 @@ def create_delta(old_image: str, new_image: str, output_path: str):
     print()
 
     print("Parsing images...")
-    old_index, old_layers, old_blobs = parse_oci_image(old_image)
-    new_index, new_layers, new_blobs = parse_oci_image(new_image)
+    old_index, old_layers, old_blobs, old_diff_ids = parse_oci_image(old_image)
+    new_index, new_layers, new_blobs, new_diff_ids = parse_oci_image(new_image)
 
+    # Build reverse mapping for old image: diff_id -> layer_digest
+    old_diff_id_set = set(old_diff_ids.keys())
+
+    # Find layers that match by compressed digest
     common_layers = old_layers & new_layers
-    new_only_layers = new_layers - old_layers
 
-    print(f"Common layers (will skip): {len(common_layers)}")
+    # Find layers that match by diff_id but not by compressed digest (recompressed)
+    recompressed_layers = set()
+    for diff_id, new_layer_digest in new_diff_ids.items():
+        if diff_id in old_diff_id_set and new_layer_digest not in common_layers:
+            recompressed_layers.add(new_layer_digest)
+
+    # Layers that are truly new (neither digest nor diff_id matches)
+    new_only_layers = new_layers - common_layers - recompressed_layers
+
+    print(f"Common layers (same digest, will skip): {len(common_layers)}")
+    print(f"Recompressed layers (same content, different compression, will skip): {len(recompressed_layers)}")
     print(f"New layers (will process): {len(new_only_layers)}")
 
     print("\nCollecting ostree objects from old image...")
@@ -239,6 +274,9 @@ def create_delta(old_image: str, new_image: str, output_path: str):
                         print(f"      No reusable ostree objects - copying original compressed blob")
                         delta_tar.addfile(blob_member, new_tar.extractfile(blob_member))
 
+                # Note: Common and recompressed layers are not included in the delta
+                # They can be reused from the old image without transfer
+
     delta_size = Path(output_path).stat().st_size
     new_size = Path(new_image).stat().st_size
 
@@ -246,6 +284,10 @@ def create_delta(old_image: str, new_image: str, output_path: str):
     print(f"  New image size: {new_size:,} bytes")
     print(f"  Delta file size: {delta_size:,} bytes")
     print(f"  Savings: {new_size - delta_size:,} bytes ({(1 - delta_size/new_size)*100:.1f}%)")
+    print(f"\nLayer summary:")
+    print(f"  Identical layers (skipped): {len(common_layers)}")
+    print(f"  Recompressed layers (same content, skipped): {len(recompressed_layers)}")
+    print(f"  New layers (included): {len(new_only_layers)}")
 
 def main():
     parser = argparse.ArgumentParser(
