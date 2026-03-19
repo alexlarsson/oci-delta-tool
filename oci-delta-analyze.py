@@ -1,109 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
-import tarfile
-import hashlib
 import sys
+import tarfile
 from pathlib import Path
-from typing import Dict, Set, List, Tuple
 
-def parse_oci_image(image_path: str) -> Tuple[Dict, Set[str], Dict[str, tarfile.TarInfo], Dict[str, str]]:
-    """
-    Parse an OCI image tar file and extract:
-    - index.json content
-    - set of blob digests (layer blobs)
-    - mapping of blob digest to TarInfo for accessing blob data
-    - mapping of diff_id (uncompressed digest) to compressed layer digest
-    """
-    index_data = None
-    layer_blobs = set()
-    blob_members = {}
-    diff_id_to_digest = {}
-
-    with tarfile.open(image_path, 'r') as tar:
-        # Read index.json
-        try:
-            index_member = tar.getmember('index.json')
-            f = tar.extractfile(index_member)
-            index_data = json.load(f)
-        except KeyError:
-            print(f"Error: No index.json found in {image_path}", file=sys.stderr)
-            sys.exit(1)
-
-        # Collect all blob members
-        for member in tar.getmembers():
-            if member.name.startswith('blobs/sha256/'):
-                digest = member.name.split('/')[-1]
-                blob_members[digest] = member
-
-        # Parse manifest to find layer blobs
-        for manifest_desc in index_data.get('manifests', []):
-            manifest_digest = manifest_desc['digest'].split(':')[-1]
-            if manifest_digest in blob_members:
-                manifest_member = blob_members[manifest_digest]
-                f = tar.extractfile(manifest_member)
-                manifest = json.load(f)
-
-                # Get config to access diff_ids
-                config_digest = manifest.get('config', {}).get('digest', '').split(':')[-1]
-                if config_digest and config_digest in blob_members:
-                    config_member = blob_members[config_digest]
-                    config_f = tar.extractfile(config_member)
-                    config_data = json.load(config_f)
-
-                    # Get diff_ids (uncompressed layer digests)
-                    diff_ids = config_data.get('rootfs', {}).get('diff_ids', [])
-                    layers = manifest.get('layers', [])
-
-                    # Map diff_id to compressed layer digest
-                    for i, layer in enumerate(layers):
-                        layer_digest = layer['digest'].split(':')[-1]
-                        layer_blobs.add(layer_digest)
-
-                        if i < len(diff_ids):
-                            diff_id = diff_ids[i].split(':')[-1]
-                            diff_id_to_digest[diff_id] = layer_digest
-                else:
-                    # Fallback if no config available
-                    for layer in manifest.get('layers', []):
-                        layer_digest = layer['digest'].split(':')[-1]
-                        layer_blobs.add(layer_digest)
-
-    return index_data, layer_blobs, blob_members, diff_id_to_digest
-
-def list_layer_contents(tar: tarfile.TarFile, blob_digest: str, blob_members: Dict[str, tarfile.TarInfo]) -> List[str]:
-    """
-    List contents of a compressed layer blob.
-    Layer blobs are gzipped tar files.
-    """
-    if blob_digest not in blob_members:
-        return []
-
-    blob_member = blob_members[blob_digest]
-    blob_file = tar.extractfile(blob_member)
-
-    contents = []
-    try:
-        with tarfile.open(fileobj=blob_file, mode='r:*') as layer_tar:
-            for member in layer_tar.getmembers():
-                contents.append(member.name)
-    except Exception as e:
-        print(f"Warning: Could not read layer {blob_digest}: {e}", file=sys.stderr)
-
-    return contents
-
-def find_ostree_objects(file_list: List[str]) -> Set[str]:
-    """
-    Find ostree object files in a file list.
-    Pattern: sysroot/ostree/repo/objects/XX/YYYYYY....file
-    """
-    ostree_objects = set()
-    for filepath in file_list:
-        # Match pattern like sysroot/ostree/repo/objects/c8/552977359a0e4484f572b9bf94b79c0afee63852aa9491bc6fac5274b87168.file
-        if filepath.startswith('sysroot/ostree/repo/objects/') and filepath.endswith('.file'):
-            ostree_objects.add(filepath)
-    return ostree_objects
+from oci_delta_common import (
+    parse_oci_image,
+    find_ostree_objects_in_layer
+)
 
 def analyze_delta(old_image: str, new_image: str):
     """
@@ -179,8 +84,7 @@ def analyze_delta(old_image: str, new_image: str):
 
     with tarfile.open(old_image, 'r') as tar:
         for layer_digest in old_layers:
-            contents = list_layer_contents(tar, layer_digest, old_blobs)
-            ostree_files = find_ostree_objects(contents)
+            ostree_files = find_ostree_objects_in_layer(tar, layer_digest, old_blobs)
             old_ostree_objects.update(ostree_files)
 
     print(f"Found {len(old_ostree_objects)} ostree object files in old image")
@@ -194,8 +98,7 @@ def analyze_delta(old_image: str, new_image: str):
     with tarfile.open(new_image, 'r') as tar:
         for layer_digest in new_only_layers:
             print(f"\n  Layer {layer_digest[:16]}...")
-            contents = list_layer_contents(tar, layer_digest, new_blobs)
-            ostree_files = find_ostree_objects(contents)
+            ostree_files = find_ostree_objects_in_layer(tar, layer_digest, new_blobs)
 
             if ostree_files:
                 total_ostree_in_new += len(ostree_files)

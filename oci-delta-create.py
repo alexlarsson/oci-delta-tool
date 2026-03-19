@@ -3,188 +3,21 @@
 import argparse
 import json
 import tarfile
-import struct
 import sys
 import gzip
 import io
 from pathlib import Path
-from typing import Dict, Set, BinaryIO
 
-CHUNK_TYPE_DATA = 0x00
-CHUNK_TYPE_OSTREE = 0x01
-
-def parse_oci_image(image_path: str):
-    """Parse OCI image and return index, layers, blob members, and diff_id mapping."""
-    index_data = None
-    layer_blobs = set()
-    blob_members = {}
-    diff_id_to_digest = {}  # Map uncompressed digest to compressed digest
-
-    with tarfile.open(image_path, 'r') as tar:
-        try:
-            index_member = tar.getmember('index.json')
-            f = tar.extractfile(index_member)
-            index_data = json.load(f)
-        except KeyError:
-            print(f"Error: No index.json found in {image_path}", file=sys.stderr)
-            sys.exit(1)
-
-        for member in tar.getmembers():
-            if member.name.startswith('blobs/sha256/'):
-                digest = member.name.split('/')[-1]
-                blob_members[digest] = member
-
-        for manifest_desc in index_data.get('manifests', []):
-            manifest_digest = manifest_desc['digest'].split(':')[-1]
-            if manifest_digest in blob_members:
-                manifest_member = blob_members[manifest_digest]
-                f = tar.extractfile(manifest_member)
-                manifest = json.load(f)
-
-                # Get config to access diff_ids
-                config_digest = manifest.get('config', {}).get('digest', '').split(':')[-1]
-                if config_digest and config_digest in blob_members:
-                    config_member = blob_members[config_digest]
-                    config_f = tar.extractfile(config_member)
-                    config_data = json.load(config_f)
-
-                    # Get diff_ids (uncompressed layer digests)
-                    diff_ids = config_data.get('rootfs', {}).get('diff_ids', [])
-                    layers = manifest.get('layers', [])
-
-                    # Map diff_id to compressed layer digest
-                    for i, layer in enumerate(layers):
-                        layer_digest = layer['digest'].split(':')[-1]
-                        layer_blobs.add(layer_digest)
-
-                        if i < len(diff_ids):
-                            diff_id = diff_ids[i].split(':')[-1]
-                            diff_id_to_digest[diff_id] = layer_digest
-                else:
-                    # Fallback if no config available
-                    for layer in manifest.get('layers', []):
-                        layer_digest = layer['digest'].split(':')[-1]
-                        layer_blobs.add(layer_digest)
-
-    return index_data, layer_blobs, blob_members, diff_id_to_digest
-
-def find_ostree_objects_in_layer(tar: tarfile.TarFile, blob_digest: str, blob_members: Dict) -> Set[str]:
-    """Find all ostree object files in a layer."""
-    if blob_digest not in blob_members:
-        return set()
-
-    blob_member = blob_members[blob_digest]
-    blob_file = tar.extractfile(blob_member)
-
-    ostree_objects = set()
-    try:
-        with tarfile.open(fileobj=blob_file, mode='r:*') as layer_tar:
-            for member in layer_tar.getmembers():
-                if (member.name.startswith('sysroot/ostree/repo/objects/') and
-                    member.name.endswith('.file') and member.isfile()):
-                    ostree_objects.add(member.name)
-    except Exception as e:
-        print(f"Warning: Could not read layer {blob_digest}: {e}", file=sys.stderr)
-
-    return ostree_objects
-
-def extract_ostree_digest(filepath: str) -> str:
-    """
-    Extract ostree object digest from filepath.
-    Example: sysroot/ostree/repo/objects/c8/552977...68.file -> c8552977...68
-    """
-    parts = filepath.split('/')
-    if len(parts) >= 2:
-        dir_name = parts[-2]
-        file_name = parts[-1].replace('.file', '')
-        return dir_name + file_name
-    return None
-
-def write_chunk(output: BinaryIO, chunk_type: int, data: bytes):
-    """Write a chunk to the output stream."""
-    output.write(struct.pack('B', chunk_type))
-    output.write(struct.pack('>Q', len(data)))
-    output.write(data)
-
-def parse_tar_header(header_bytes: bytes) -> dict:
-    """Parse a 512-byte tar header."""
-    if len(header_bytes) != 512:
-        return None
-
-    if header_bytes == b'\x00' * 512:
-        return {'type': 'zero'}
-
-    try:
-        name = header_bytes[0:100].rstrip(b'\x00').decode('utf-8', errors='ignore')
-        size_str = header_bytes[124:136].rstrip(b'\x00 ').decode('ascii', errors='ignore')
-
-        if not size_str:
-            return {'type': 'zero'}
-
-        size = int(size_str, 8)
-        return {
-            'type': 'file',
-            'name': name,
-            'size': size
-        }
-    except (ValueError, UnicodeDecodeError):
-        return None
-
-def chunk_layer(layer_stream: BinaryIO, reusable_ostree: Set[str]) -> bytes:
-    """
-    Convert an uncompressed tar stream to chunked format.
-
-    Args:
-        layer_stream: Uncompressed tar file stream
-        reusable_ostree: Set of ostree object paths that exist in old image
-
-    Returns:
-        Chunked data as bytes
-    """
-    output = io.BytesIO()
-
-    while True:
-        header_bytes = layer_stream.read(512)
-        if len(header_bytes) < 512:
-            break
-
-        header_info = parse_tar_header(header_bytes)
-
-        if not header_info or header_info['type'] == 'zero':
-            write_chunk(output, CHUNK_TYPE_DATA, header_bytes)
-            if len(header_bytes) < 512:
-                break
-            continue
-
-        write_chunk(output, CHUNK_TYPE_DATA, header_bytes)
-
-        file_size = header_info['size']
-        file_name = header_info['name']
-
-        is_reusable_ostree = file_name in reusable_ostree
-
-        if is_reusable_ostree:
-            ostree_digest = extract_ostree_digest(file_name)
-            if ostree_digest:
-                digest_bytes = bytes.fromhex(ostree_digest)
-                write_chunk(output, CHUNK_TYPE_OSTREE, digest_bytes)
-
-                layer_stream.read(file_size)
-            else:
-                data = layer_stream.read(file_size)
-                write_chunk(output, CHUNK_TYPE_DATA, data)
-        else:
-            data = layer_stream.read(file_size)
-            if data:
-                write_chunk(output, CHUNK_TYPE_DATA, data)
-
-        padding_size = (512 - (file_size % 512)) % 512
-        if padding_size > 0:
-            padding = layer_stream.read(padding_size)
-            if padding:
-                write_chunk(output, CHUNK_TYPE_DATA, padding)
-
-    return output.getvalue()
+from oci_delta_common import (
+    CHUNK_TYPE_DATA,
+    CHUNK_TYPE_OSTREE,
+    parse_oci_image,
+    find_ostree_objects_in_layer,
+    extract_ostree_digest,
+    write_chunk,
+    parse_tar_header,
+    chunk_layer
+)
 
 def create_delta(old_image: str, new_image: str, output_path: str):
     """Create a delta update file."""

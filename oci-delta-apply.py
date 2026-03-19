@@ -3,85 +3,17 @@
 import argparse
 import json
 import tarfile
-import struct
 import sys
 import gzip
 import io
-import os
-import stat
 from pathlib import Path
 
-CHUNK_TYPE_DATA = 0x00
-CHUNK_TYPE_OSTREE = 0x01
-
-def read_chunk(stream):
-    """Read a single chunk from the stream."""
-    chunk_type_bytes = stream.read(1)
-    if not chunk_type_bytes:
-        return None
-
-    chunk_type = struct.unpack('B', chunk_type_bytes)[0]
-    size_bytes = stream.read(8)
-    if len(size_bytes) < 8:
-        return None
-
-    size = struct.unpack('>Q', size_bytes)[0]
-    data = stream.read(size)
-
-    return {
-        'type': chunk_type,
-        'size': size,
-        'data': data
-    }
-
-def reconstruct_layer(chunk_stream, ostree_root: Path = None):
-    """
-    Reconstruct a layer tar stream from chunks.
-
-    Returns (tar_data, missing_objects)
-    """
-    output = io.BytesIO()
-    missing_objects = []
-
-    while True:
-        chunk = read_chunk(chunk_stream)
-        if not chunk:
-            break
-
-        if chunk['type'] == CHUNK_TYPE_DATA:
-            output.write(chunk['data'])
-        elif chunk['type'] == CHUNK_TYPE_OSTREE:
-            digest = chunk['data'].hex()
-
-            if not ostree_root:
-                missing_objects.append(digest)
-                print(f"Error: OSTREE chunk found but no ostree repo provided", file=sys.stderr)
-                print(f"  Digest: {digest}", file=sys.stderr)
-                continue
-
-            ostree_path = ostree_root / 'objects' / digest[0:2] / f"{digest[2:]}.file"
-            try:
-                if ostree_path.exists():
-                    current_mode = ostree_path.stat().st_mode
-                    needs_chmod = not (current_mode & stat.S_IRUSR)
-
-                    if needs_chmod:
-                        os.chmod(ostree_path, current_mode | stat.S_IRUSR)
-
-                    try:
-                        with open(ostree_path, 'rb') as f:
-                            output.write(f.read())
-                    finally:
-                        if needs_chmod:
-                            os.chmod(ostree_path, current_mode)
-                else:
-                    missing_objects.append(str(ostree_path))
-                    print(f"Error: Ostree object not found: {ostree_path}", file=sys.stderr)
-            except (PermissionError, OSError) as e:
-                missing_objects.append(f"{digest} ({e})")
-                print(f"Error reading ostree object {digest}: {e}", file=sys.stderr)
-
-    return output.getvalue(), missing_objects
+from oci_delta_common import (
+    CHUNK_TYPE_DATA,
+    CHUNK_TYPE_OSTREE,
+    read_chunk,
+    reconstruct_layer
+)
 
 def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
     """Apply a delta file to create a standard OCI archive."""

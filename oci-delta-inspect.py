@@ -3,104 +3,19 @@
 import argparse
 import json
 import tarfile
-import struct
 import sys
 import gzip
 import hashlib
-import io
 from pathlib import Path
 
-CHUNK_TYPE_DATA = 0x00
-CHUNK_TYPE_OSTREE = 0x01
-
-def read_chunk(stream):
-    """Read a single chunk from the stream."""
-    chunk_type_bytes = stream.read(1)
-    if not chunk_type_bytes:
-        return None
-
-    chunk_type = struct.unpack('B', chunk_type_bytes)[0]
-    size_bytes = stream.read(8)
-    if len(size_bytes) < 8:
-        return None
-
-    size = struct.unpack('>Q', size_bytes)[0]
-    data = stream.read(size)
-
-    return {
-        'type': chunk_type,
-        'size': size,
-        'data': data
-    }
-
-def format_size(size_bytes):
-    """Format size in human-readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
-
-def reconstruct_tar_from_chunks(chunk_stream, ostree_root: Path = None):
-    """
-    Reconstruct tar data from chunks.
-
-    Returns (tar_data, has_ostree_refs, missing_objects)
-    """
-    import os
-    import stat
-
-    output = io.BytesIO()
-    has_ostree_refs = False
-    missing_objects = []
-
-    while True:
-        chunk = read_chunk(chunk_stream)
-        if not chunk:
-            break
-
-        if chunk['type'] == CHUNK_TYPE_DATA:
-            output.write(chunk['data'])
-        elif chunk['type'] == CHUNK_TYPE_OSTREE:
-            has_ostree_refs = True
-            digest = chunk['data'].hex()
-
-            if ostree_root:
-                ostree_path = ostree_root / 'objects' / digest[0:2] / f"{digest[2:]}.file"
-                try:
-                    if ostree_path.exists():
-                        current_mode = ostree_path.stat().st_mode
-                        needs_chmod = not (current_mode & stat.S_IRUSR)
-
-                        if needs_chmod:
-                            os.chmod(ostree_path, current_mode | stat.S_IRUSR)
-
-                        try:
-                            with open(ostree_path, 'rb') as f:
-                                output.write(f.read())
-                        finally:
-                            if needs_chmod:
-                                os.chmod(ostree_path, current_mode)
-                    else:
-                        missing_objects.append(str(ostree_path))
-                except (PermissionError, OSError) as e:
-                    missing_objects.append(f"{digest} ({e})")
-            else:
-                missing_objects.append(digest)
-
-    return output.getvalue(), has_ostree_refs, missing_objects
-
-def get_config_and_diff_ids(tar, all_blobs, manifest_data):
-    """Extract config and diff_ids from manifest."""
-    config_digest = manifest_data.get('config', {}).get('digest', '').split(':')[-1]
-    if config_digest not in all_blobs:
-        return None, []
-
-    config_member = all_blobs[config_digest]
-    config_data = json.load(tar.extractfile(config_member))
-    diff_ids = config_data.get('rootfs', {}).get('diff_ids', [])
-
-    return config_digest, diff_ids
+from oci_delta_common import (
+    CHUNK_TYPE_DATA,
+    CHUNK_TYPE_OSTREE,
+    read_chunk,
+    format_size,
+    reconstruct_tar_from_chunks,
+    get_config_and_diff_ids
+)
 
 def inspect_delta(delta_path: str, verbose: bool = False, verify: bool = False, ostree_repo: str = None):
     """Inspect a delta file and show its structure."""
