@@ -5,10 +5,8 @@ import sys
 import tarfile
 from pathlib import Path
 
-from oci_delta_common import (
-    parse_oci_image,
-    find_ostree_objects_in_layer
-)
+from oci_delta_common import parse_oci_image, find_ostree_objects_in_layer
+
 
 def analyze_delta(old_image: str, new_image: str):
     """
@@ -21,10 +19,10 @@ def analyze_delta(old_image: str, new_image: str):
 
     # Parse both images
     print("Parsing old image...")
-    old_index, old_layers, old_blobs, old_diff_ids = parse_oci_image(old_image)
+    _, old_layers, old_blobs, old_diff_ids = parse_oci_image(old_image)
 
     print("Parsing new image...")
-    new_index, new_layers, new_blobs, new_diff_ids = parse_oci_image(new_image)
+    _, new_layers, new_blobs, new_diff_ids = parse_oci_image(new_image)
 
     print()
     print("=" * 80)
@@ -50,7 +48,9 @@ def analyze_delta(old_image: str, new_image: str):
     print(f"\nLayers in old image: {len(old_layers)}")
     print(f"Layers in new image: {len(new_layers)}")
     print(f"Common layers (same digest, can skip): {len(common_layers)}")
-    print(f"Recompressed layers (same content, different compression, can skip): {len(recompressed_layers)}")
+    print(
+        f"Recompressed layers (same content, different compression, can skip): {len(recompressed_layers)}"
+    )
     print(f"New layers (need to process): {len(new_only_layers)}")
     print(f"Old-only layers (removed): {len(old_only_layers)}")
 
@@ -82,7 +82,7 @@ def analyze_delta(old_image: str, new_image: str):
     print("\nScanning old image for ostree objects...")
     old_ostree_objects = set()
 
-    with tarfile.open(old_image, 'r') as tar:
+    with tarfile.open(old_image, "r") as tar:
         for layer_digest in old_layers:
             ostree_files = find_ostree_objects_in_layer(tar, layer_digest, old_blobs)
             old_ostree_objects.update(ostree_files)
@@ -95,7 +95,7 @@ def analyze_delta(old_image: str, new_image: str):
     total_ostree_in_new = 0
     reusable_ostree = 0
 
-    with tarfile.open(new_image, 'r') as tar:
+    with tarfile.open(new_image, "r") as tar:
         for layer_digest in new_only_layers:
             print(f"\n  Layer {layer_digest[:16]}...")
             ostree_files = find_ostree_objects_in_layer(tar, layer_digest, new_blobs)
@@ -123,24 +123,29 @@ def analyze_delta(old_image: str, new_image: str):
     print("=" * 80)
     print(f"\nLayer optimization:")
     print(f"  - {len(common_layers)} identical layers can be skipped")
-    print(f"  - {len(recompressed_layers)} recompressed layers can be skipped (same content)")
+    print(
+        f"  - {len(recompressed_layers)} recompressed layers can be skipped (same content)"
+    )
     print(f"  - {len(new_only_layers)} layers need to be processed")
 
     print(f"\nOstree object optimization:")
     print(f"  - {total_ostree_in_new} ostree objects in new layers")
-    print(f"  - {reusable_ostree} can reuse content from old image (keep tar headers only)")
+    print(
+        f"  - {reusable_ostree} can reuse content from old image (keep tar headers only)"
+    )
     print(f"  - {total_ostree_in_new - reusable_ostree} need full content")
 
     if total_ostree_in_new > 0:
         savings_pct = (reusable_ostree / total_ostree_in_new) * 100
         print(f"  - Potential ostree object reuse: {savings_pct:.1f}%")
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze delta opportunities between two bootc OCI images'
+        description="Analyze delta opportunities between two bootc OCI images"
     )
-    parser.add_argument('old_image', help='Path to old OCI image tar file')
-    parser.add_argument('new_image', help='Path to new OCI image tar file')
+    parser.add_argument("old_image", help="Path to old OCI image tar file")
+    parser.add_argument("new_image", help="Path to new OCI image tar file")
 
     args = parser.parse_args()
 
@@ -155,5 +160,6 @@ def main():
 
     analyze_delta(args.old_image, args.new_image)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
