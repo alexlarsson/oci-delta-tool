@@ -1,0 +1,23 @@
+FROM scratch
+
+# Reuse existing ostree object (same digest)
+COPY --chmod=444 <<'EOF' /sysroot/ostree/repo/objects/ab/cdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.file
+This is a simulated ostree object content
+It represents a file that could be reused from the old image
+EOF
+
+# New ostree object (different content)
+COPY --chmod=444 <<'EOF' /sysroot/ostree/repo/objects/99/8877665544332211009988776655443322110099887766554433221100998877.file
+This is a NEW ostree object
+It was added in this update
+EOF
+
+COPY --chmod=755 <<'EOF' /usr/bin/app
+#!/bin/sh
+echo "Updated application with ostree objects"
+EOF
+
+COPY --chmod=644 <<'EOF' /etc/app.conf
+app_version=2.0
+new_feature=enabled
+EOF

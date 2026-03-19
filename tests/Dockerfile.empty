@@ -1,0 +1,5 @@
+FROM scratch
+
+# This creates a minimal image with just one small file
+COPY --chmod=644 <<'EOF' /empty
+EOF

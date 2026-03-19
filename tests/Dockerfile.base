@@ -1,0 +1,10 @@
+FROM scratch
+
+COPY --chmod=755 <<'EOF' /usr/bin/test-file
+#!/bin/sh
+echo "Base layer file"
+EOF
+
+COPY --chmod=644 <<'EOF' /etc/config
+base_config=true
+EOF

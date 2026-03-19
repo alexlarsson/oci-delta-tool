@@ -1,0 +1,21 @@
+FROM scratch
+
+# Simulate ostree objects that would be reused
+COPY --chmod=444 <<'EOF' /sysroot/ostree/repo/objects/ab/cdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.file
+This is a simulated ostree object content
+It represents a file that could be reused from the old image
+EOF
+
+COPY --chmod=444 <<'EOF' /sysroot/ostree/repo/objects/12/3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01.file
+Another ostree object
+This one is also reusable
+EOF
+
+COPY --chmod=755 <<'EOF' /usr/bin/app
+#!/bin/sh
+echo "Application with ostree objects"
+EOF
+
+COPY --chmod=644 <<'EOF' /etc/app.conf
+app_version=1.0
+EOF

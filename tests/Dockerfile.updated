@@ -1,0 +1,16 @@
+FROM scratch
+
+COPY --chmod=755 <<'EOF' /usr/bin/test-file
+#!/bin/sh
+echo "Updated layer file"
+EOF
+
+COPY --chmod=644 <<'EOF' /etc/config
+base_config=true
+updated=true
+EOF
+
+COPY --chmod=755 <<'EOF' /usr/bin/new-tool
+#!/bin/sh
+echo "New tool added in update"
+EOF
