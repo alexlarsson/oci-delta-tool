@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import tarfile
 import sys
 import gzip
 import io
+import tempfile
+import subprocess
 from pathlib import Path
 
-from oci_delta_common import reconstruct_layer
 
-
-def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
+def apply_delta(delta_path: str, output_path: str, delta_source: str = "/"):
     """Apply a delta file to create a standard OCI archive."""
     print(f"Applying delta:")
     print(f"  Delta: {delta_path}")
     print(f"  Output: {output_path}")
-    if ostree_repo:
-        print(f"  Ostree repo: {ostree_repo}")
+    print(f"  Delta source: {delta_source}")
     print()
 
-    ostree_root = Path(ostree_repo) if ostree_repo else None
-    if ostree_root and not ostree_root.exists():
-        print(f"Warning: Ostree repo not found: {ostree_repo}", file=sys.stderr)
-        ostree_root = None
+    source_root = Path(delta_source)
+    if not source_root.exists():
+        print(f"Warning: Delta source not found: {delta_source}", file=sys.stderr)
 
     with gzip.open(delta_path, "rb") as delta_gz:
         with tarfile.open(fileobj=delta_gz, mode="r") as delta_tar:
@@ -50,6 +49,8 @@ def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
 
             # Read manifest to identify layers and preserve order
             manifest_list = []
+            layer_to_diff_id = {}  # layer_digest -> expected diff_id
+
             for manifest_desc in index_data.get("manifests", []):
                 manifest_digest = manifest_desc["digest"].split(":")[-1]
                 manifest_path = f"blobs/sha256/{manifest_digest}"
@@ -63,6 +64,21 @@ def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
                     for layer in manifest_data.get("layers", []):
                         layer_digest = layer["digest"].split(":")[-1]
                         layer_digests.add(layer_digest)
+
+                    # Extract diff_ids from config for validation
+                    config_digest = manifest_data.get("config", {}).get("digest", "").split(":")[-1]
+                    if config_digest and f"blobs/sha256/{config_digest}" in all_members:
+                        config_member = all_members[f"blobs/sha256/{config_digest}"]
+                        config_data = json.load(delta_tar.extractfile(config_member))
+                        diff_ids = config_data.get("rootfs", {}).get("diff_ids", [])
+
+                        # Map layer digests to their expected diff_ids
+                        layers = manifest_data.get("layers", [])
+                        for i, layer in enumerate(layers):
+                            if i < len(diff_ids):
+                                layer_digest = layer["digest"].split(":")[-1]
+                                expected_diff_id = diff_ids[i].split(":")[-1]
+                                layer_to_diff_id[layer_digest] = expected_diff_id
 
             print(f"Found {len(layer_digests)} layers in delta")
             print("\nCreating standard OCI archive...")
@@ -121,66 +137,99 @@ def apply_delta(delta_path: str, output_path: str, ostree_repo: str = None):
                             blob_sizes[digest] = len(blob_data)
                             # No digest change - same as original
                         else:
-                            # Chunked layer - reconstruct and compress
-                            print(f"  Processing layer {digest[:16]}... (chunked)")
+                            # tar-diff layer - reconstruct using tar-patch
+                            print(f"  Processing layer {digest[:16]}... (tar-diff)")
 
-                            tar_data, missing = reconstruct_layer(
-                                blob_stream, ostree_root
-                            )
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                tmpdir_path = Path(tmpdir)
 
-                            if missing:
-                                print(
-                                    f"    Warning: {len(missing)} missing ostree objects",
-                                    file=sys.stderr,
-                                )
-                                if not ostree_root:
+                                # Extract tar-diff to temp file
+                                tar_diff_path = tmpdir_path / f"{digest[:16]}.tar-diff"
+                                with open(tar_diff_path, "wb") as f:
+                                    f.write(blob_stream.read())
+
+                                # Run tar-patch to reconstruct
+                                reconstructed_path = tmpdir_path / f"{digest[:16]}.tar"
+                                tar_patch_cmd = [
+                                    "tar-patch",
+                                    str(tar_diff_path),
+                                    str(source_root),
+                                    str(reconstructed_path),
+                                ]
+
+                                try:
+                                    subprocess.run(
+                                        tar_patch_cmd, check=True, capture_output=True
+                                    )
+                                except subprocess.CalledProcessError as e:
                                     print(
-                                        f"    Provide --ostree-repo to resolve OSTREE chunks",
+                                        f"    Error: tar-patch failed: {e.stderr.decode()}",
                                         file=sys.stderr,
                                     )
+                                    sys.exit(1)
 
-                            # Compress the reconstructed tar data with reproducible settings
-                            # Match podman/buildah compression: level 9, no filename, mtime=0
-                            compressed = io.BytesIO()
-                            with gzip.GzipFile(
-                                fileobj=compressed,
-                                mode="wb",
-                                compresslevel=9,
-                                mtime=0,
-                                filename="",
-                            ) as gz:
-                                gz.write(tar_data)
+                                # Read reconstructed tar
+                                with open(reconstructed_path, "rb") as f:
+                                    tar_data = f.read()
 
-                            compressed_data = compressed.getvalue()
+                                # Validate diff_id if we have the expected value
+                                actual_diff_id = hashlib.sha256(tar_data).hexdigest()
+                                if digest in layer_to_diff_id:
+                                    expected_diff_id = layer_to_diff_id[digest]
+                                    if actual_diff_id != expected_diff_id:
+                                        print(
+                                            f"    Error: diff_id mismatch!",
+                                            file=sys.stderr,
+                                        )
+                                        print(
+                                            f"      Expected: {expected_diff_id}",
+                                            file=sys.stderr,
+                                        )
+                                        print(
+                                            f"      Actual:   {actual_diff_id}",
+                                            file=sys.stderr,
+                                        )
+                                        sys.exit(1)
+                                    print(f"    Validated diff_id: {actual_diff_id[:16]}...")
 
-                            # Compute new digest for compressed data
-                            import hashlib
+                                # Compress the reconstructed tar data with reproducible settings
+                                # Match podman/buildah compression: level 9, no filename, mtime=0
+                                compressed = io.BytesIO()
+                                with gzip.GzipFile(
+                                    fileobj=compressed,
+                                    mode="wb",
+                                    compresslevel=9,
+                                    mtime=0,
+                                    filename="",
+                                ) as gz:
+                                    gz.write(tar_data)
 
-                            new_digest = hashlib.sha256(compressed_data).hexdigest()
-                            digest_mapping[digest] = new_digest
-                            blob_sizes[new_digest] = len(compressed_data)
+                                compressed_data = compressed.getvalue()
 
-                            print(f"    Reconstructed: {len(tar_data):,} bytes")
-                            print(f"    Compressed: {len(compressed_data):,} bytes")
-                            print(f"    Old digest: {digest[:16]}...")
-                            print(f"    New digest: {new_digest[:16]}...")
+                                # Compute new digest for compressed data
+                                new_digest = hashlib.sha256(compressed_data).hexdigest()
+                                digest_mapping[digest] = new_digest
+                                blob_sizes[new_digest] = len(compressed_data)
 
-                            # Create new tar member with new digest in name
-                            layer_member = tarfile.TarInfo(
-                                name=f"blobs/sha256/{new_digest}"
-                            )
-                            layer_member.size = len(compressed_data)
-                            output_tar.addfile(
-                                layer_member, io.BytesIO(compressed_data)
-                            )
+                                print(f"    Reconstructed: {len(tar_data):,} bytes")
+                                print(f"    Compressed: {len(compressed_data):,} bytes")
+                                print(f"    Old digest: {digest[:16]}...")
+                                print(f"    New digest: {new_digest[:16]}...")
+
+                                # Create new tar member with new digest in name
+                                layer_member = tarfile.TarInfo(
+                                    name=f"blobs/sha256/{new_digest}"
+                                )
+                                layer_member.size = len(compressed_data)
+                                output_tar.addfile(
+                                    layer_member, io.BytesIO(compressed_data)
+                                )
                     else:
                         # Non-layer blob (manifest, config) - we'll handle these after updating
                         pass
 
                 # Now update and write manifests with new layer digests
                 print("\n  Updating manifests and metadata...")
-                import hashlib
-
                 updated_manifests = []
 
                 for manifest_desc, manifest_data, old_manifest_digest in manifest_list:
@@ -292,9 +341,10 @@ def main():
     parser.add_argument("delta_file", help="Path to delta file (.tar.gz)")
     parser.add_argument("output", help="Path for output OCI archive (.tar)")
     parser.add_argument(
-        "--ostree-repo",
+        "--delta-source",
         metavar="PATH",
-        help="Path to ostree repo for reconstructing OSTREE chunks (e.g., /sysroot/ostree/repo)",
+        default="/",
+        help="Source directory for tar-patch delta reconstruction (default: /)",
     )
 
     args = parser.parse_args()
@@ -303,7 +353,7 @@ def main():
         print(f"Error: Delta file not found: {args.delta_file}", file=sys.stderr)
         sys.exit(1)
 
-    apply_delta(args.delta_file, args.output, args.ostree_repo)
+    apply_delta(args.delta_file, args.output, args.delta_source)
 
 
 if __name__ == "__main__":
